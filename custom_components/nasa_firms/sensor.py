@@ -21,6 +21,7 @@ from .api import bearing_deg, cardinal, smoke_offset
 from .const import ATTRIBUTION, ATTRIBUTION_WEATHER, DOMAIN
 from .coordinator import FirmsCoordinator, FirmsData, NasaFirmsConfigEntry
 from .ngfs_coordinator import NgfsCoordinator
+from .wfigs_coordinator import WfigsCoordinator
 
 
 KM_TO_MILES = 0.621371192237334
@@ -333,71 +334,109 @@ def _ngfs_toward_attrs(c):
     }
 
 def _combined_nearest(c):
-    """Closest current fire representation across FIRMS and NGFS.
+    """Closest associated wildfire across WFIGS, NGFS and FIRMS."""
+    if not c.data.combined_incidents:
+        return None
+    return c.data.combined_incidents[0]
 
-    This intentionally does not claim cross-feed deduplication yet. It is the
-    closest observation from either feed and serves as stable groundwork for
-    cards/alerts while event association is developed separately.
-    """
-    firms = c.firms.data.clusters[0] if c.firms.data.clusters else None
-    ngfs = c.data.tracked_fires[0] if c.data.tracked_fires else None
-    if firms is None:
-        return ("NGFS", ngfs) if ngfs else (None, None)
-    if ngfs is None:
-        return "FIRMS", firms
-    return ("FIRMS", firms) if firms.distance_km <= ngfs.distance_km else ("NGFS", ngfs)
 
 def _combined_nearest_value(c):
-    _, fire = _combined_nearest(c)
+    fire = _combined_nearest(c)
     return round(fire.distance_km * KM_TO_MILES, 1) if fire else None
 
-def _combined_nearest_attrs(c):
-    source, fire = _combined_nearest(c)
-    firms = c.firms.data.clusters[0] if c.firms.data.clusters else None
-    ngfs = c.data.tracked_fires[0] if c.data.tracked_fires else None
-    attrs = {
-        "source": source,
-        "alert_radius_miles": round(c.alert_radius_km * KM_TO_MILES, 1),
-        "inside_alert_radius": bool(fire and fire.distance_km <= c.alert_radius_km),
-        "firms_distance_miles": round(firms.distance_km * KM_TO_MILES, 1) if firms else None,
-        "ngfs_distance_miles": round(ngfs.distance_km * KM_TO_MILES, 1) if ngfs else None,
+
+def _incident_wfigs_attrs(i):
+    """WFIGS / IRWIN metadata carried by a combined incident."""
+    return {
+        "irwin_id": i.wfigs_irwin_id,
+        "unique_fire_identifier": i.wfigs_unique_fire_identifier,
+        "reported_acres": i.reported_acres,
+        "discovery_acres": i.discovery_acres,
+        "percent_contained": i.percent_contained,
+        "fire_cause": i.fire_cause,
+        "fire_cause_general": i.fire_cause_general,
+        "discovery_time": i.discovery_time.isoformat() if i.discovery_time else None,
+        "wfigs_modified_time": i.wfigs_modified_time.isoformat() if i.wfigs_modified_time else None,
+        "protecting_agency": i.protecting_agency,
+        "protecting_unit": i.protecting_unit,
+        "management_organization": i.management_organization,
+        "personnel": i.personnel,
+        "city": i.city,
+        "state": i.state,
     }
-    if fire is None:
+
+
+def _incident_wind(c, i, bearing):
+    """Best available wind observation for the thermal part of an incident."""
+    wind = None
+
+    if i.ngfs_tracking_id:
+        wind = c.data.tracked_wind.get(i.ngfs_tracking_id)
+
+    if wind is None and i.firms_cluster_id:
+        wind = c.firms.data.wind.get(i.firms_cluster_id)
+
+    offset = (
+        smoke_offset(wind.bearing, bearing)
+        if wind is not None and bearing is not None
+        else None
+    )
+    return wind, offset
+
+
+def _combined_nearest_attrs(c):
+    i = _combined_nearest(c)
+    attrs = {
+        "source": i.source if i else None,
+        "alert_radius_miles": round(c.alert_radius_km * KM_TO_MILES, 1),
+        "inside_alert_radius": bool(i and i.distance_km <= c.alert_radius_km),
+        "firms_distance_miles": (
+            round(c.firms.data.clusters[0].distance_km * KM_TO_MILES, 1)
+            if c.firms.data.clusters else None
+        ),
+        "ngfs_distance_miles": (
+            round(c.data.tracked_fires[0].distance_km * KM_TO_MILES, 1)
+            if c.data.tracked_fires else None
+        ),
+    }
+
+    wfigs = getattr(c.firms, "wfigs", None)
+    attrs["wfigs_distance_miles"] = (
+        round(wfigs.data.incidents[0].distance_km * KM_TO_MILES, 1)
+        if wfigs is not None and wfigs.data and wfigs.data.incidents
+        else None
+    )
+
+    if i is None:
         return attrs
 
-    attrs["direction"] = getattr(fire, "direction", None)
-    attrs["bearing"] = round(fire.bearing) if getattr(fire, "bearing", None) is not None else None
+    bearing = bearing_deg(c.latitude, c.longitude, i.latitude, i.longitude)
+    wind, offset = _incident_wind(c, i, bearing)
 
-    if source == "NGFS":
-        wind = c.data.nearest_tracked_wind
-        offset = smoke_offset(wind.bearing, fire.bearing) if wind and fire.bearing is not None else None
-        attrs.update({
-            "name": fire.name,
-            "tracking_id": fire.tracking_id,
-            "latest": fire.latest.isoformat(),
-            "max_frp": fire.max_frp,
-            "wind_bearing": round(wind.bearing) if wind else None,
-            "wind_direction": cardinal(wind.bearing) if wind else None,
-            "wind_speed_mph": round(wind.speed * MS_TO_MPH, 1) if wind else None,
-            "smoke_offset": round(offset) if offset is not None else None,
-            "smoke_relationship": _smoke_relationship(offset),
-            "smoke_confidence": _wind_confidence(wind.speed if wind else None),
-        })
-    else:
-        wind = c.firms.data.nearest_wind
-        offset = smoke_offset(wind.bearing, fire.bearing) if wind and fire.bearing is not None else None
-        attrs.update({
-            "name": None,
-            "tracking_id": None,
-            "latest": fire.acq_datetime,
-            "max_frp": fire.frp,
-            "wind_bearing": round(wind.bearing) if wind else None,
-            "wind_direction": cardinal(wind.bearing) if wind else None,
-            "wind_speed_mph": round(wind.speed * MS_TO_MPH, 1) if wind else None,
-            "smoke_offset": round(offset) if offset is not None else None,
-            "smoke_relationship": _smoke_relationship(offset),
-            "smoke_confidence": _wind_confidence(wind.speed if wind else None),
-        })
+    attrs.update({
+        "name": i.name,
+        "direction": cardinal(bearing),
+        "bearing": round(bearing) if bearing is not None else None,
+        "latest": i.latest.isoformat() if i.latest else None,
+        "max_frp": i.max_frp,
+        "firms_detections": i.firms_detections,
+        "ngfs_detections": i.ngfs_detections,
+        "tracking_id": i.ngfs_tracking_id,
+        "tracking_ids": list(i.ngfs_tracking_ids),
+        "ngfs_tracking_features": i.ngfs_tracking_features,
+        "firms_cluster_id": i.firms_cluster_id,
+        "match_distance_miles": (
+            round(i.match_distance_km * KM_TO_MILES, 1)
+            if i.match_distance_km is not None else None
+        ),
+        "wind_bearing": round(wind.bearing) if wind else None,
+        "wind_direction": cardinal(wind.bearing) if wind else None,
+        "wind_speed_mph": round(wind.speed * MS_TO_MPH, 1) if wind else None,
+        "smoke_offset": round(offset) if offset is not None else None,
+        "smoke_relationship": _smoke_relationship(offset),
+        "smoke_confidence": _wind_confidence(wind.speed if wind else None),
+    })
+    attrs.update(_incident_wfigs_attrs(i))
     return attrs
 
 
@@ -407,7 +446,9 @@ def _nearby_wildfires_attrs(c):
         "matched_firms_ngfs": c.data.matched_incidents,
         "firms_only": sum(1 for i in incidents if i.source == "FIRMS"),
         "ngfs_only": sum(1 for i in incidents if i.source == "NGFS"),
-        "both_sources": sum(1 for i in incidents if i.source == "FIRMS + NGFS"),
+        "wfigs_only": sum(1 for i in incidents if i.source == "WFIGS"),
+        "multi_source": sum(1 for i in incidents if " + " in i.source),
+        "wfigs_incidents": sum(1 for i in incidents if "WFIGS" in i.source),
         "match_distance_miles": round(5.0 * KM_TO_MILES, 1),
         "match_time_hours": 24,
         "firms_incident_group_distance_miles": round(5.0 * KM_TO_MILES, 1),
@@ -418,11 +459,16 @@ def _nearby_wildfires_attrs(c):
                 "distance_miles": round(i.distance_km * KM_TO_MILES, 1),
                 "latest": i.latest.isoformat() if i.latest else None,
                 "max_frp": i.max_frp,
+                "reported_acres": i.reported_acres,
+                "percent_contained": i.percent_contained,
+                "fire_cause": i.fire_cause_general or i.fire_cause,
+                "discovery_time": i.discovery_time.isoformat() if i.discovery_time else None,
                 "firms_detections": i.firms_detections,
                 "ngfs_detections": i.ngfs_detections,
                 "tracking_id": i.ngfs_tracking_id,
                 "tracking_ids": list(i.ngfs_tracking_ids),
                 "ngfs_tracking_features": i.ngfs_tracking_features,
+                "irwin_id": i.wfigs_irwin_id,
                 "match_distance_miles": round(i.match_distance_km * KM_TO_MILES, 1) if i.match_distance_km is not None else None,
             }
             for i in incidents[:20]
@@ -430,25 +476,31 @@ def _nearby_wildfires_attrs(c):
         "fires_list_truncated": len(incidents) > 20,
     }
 
+
 def _nearest_incident_attrs(c):
     if not c.data.combined_incidents:
         return {"source": None, "name": None}
     i = c.data.combined_incidents[0]
-    bearing = None
-    direction = None
     bearing = bearing_deg(c.latitude, c.longitude, i.latitude, i.longitude)
-    direction = cardinal(bearing)
-    return {
-        "source": i.source, "name": i.name, "direction": direction,
+    attrs = {
+        "source": i.source,
+        "name": i.name,
+        "direction": cardinal(bearing),
         "bearing": round(bearing) if bearing is not None else None,
-        "latest": i.latest.isoformat() if i.latest else None, "max_frp": i.max_frp,
-        "firms_detections": i.firms_detections, "ngfs_detections": i.ngfs_detections,
-        "tracking_id": i.ngfs_tracking_id, "tracking_ids": list(i.ngfs_tracking_ids),
-        "ngfs_tracking_features": i.ngfs_tracking_features, "firms_cluster_id": i.firms_cluster_id,
+        "latest": i.latest.isoformat() if i.latest else None,
+        "max_frp": i.max_frp,
+        "firms_detections": i.firms_detections,
+        "ngfs_detections": i.ngfs_detections,
+        "tracking_id": i.ngfs_tracking_id,
+        "tracking_ids": list(i.ngfs_tracking_ids),
+        "ngfs_tracking_features": i.ngfs_tracking_features,
+        "firms_cluster_id": i.firms_cluster_id,
         "match_distance_miles": round(i.match_distance_km * KM_TO_MILES, 1) if i.match_distance_km is not None else None,
         "inside_alert_radius": i.distance_km <= c.alert_radius_km,
         "alert_radius_miles": round(c.alert_radius_km * KM_TO_MILES, 1),
     }
+    attrs.update(_incident_wfigs_attrs(i))
+    return attrs
 
 
 def _named_incidents(c):
@@ -465,15 +517,21 @@ def _named_wildfires_attrs(c):
                 "distance_miles": round(i.distance_km * KM_TO_MILES, 1),
                 "latest": i.latest.isoformat() if i.latest else None,
                 "max_frp": i.max_frp,
+                "reported_acres": i.reported_acres,
+                "percent_contained": i.percent_contained,
+                "fire_cause": i.fire_cause_general or i.fire_cause,
+                "discovery_time": i.discovery_time.isoformat() if i.discovery_time else None,
                 "firms_detections": i.firms_detections,
                 "ngfs_detections": i.ngfs_detections,
                 "ngfs_tracking_features": i.ngfs_tracking_features,
                 "tracking_ids": list(i.ngfs_tracking_ids),
+                "irwin_id": i.wfigs_irwin_id,
             }
             for i in incidents[:10]
         ],
         "fires_list_truncated": len(incidents) > 10,
     }
+
 
 def _nearest_named_incident_attrs(c):
     incidents = _named_incidents(c)
@@ -481,8 +539,9 @@ def _nearest_named_incident_attrs(c):
         return {"name": None, "source": None}
     i = incidents[0]
     bearing = bearing_deg(c.latitude, c.longitude, i.latitude, i.longitude)
-    return {
-        "name": i.name, "source": i.source,
+    attrs = {
+        "name": i.name,
+        "source": i.source,
         "direction": cardinal(bearing),
         "bearing": round(bearing) if bearing is not None else None,
         "latest": i.latest.isoformat() if i.latest else None,
@@ -495,6 +554,9 @@ def _nearest_named_incident_attrs(c):
         "inside_alert_radius": i.distance_km <= c.alert_radius_km,
         "alert_radius_miles": round(c.alert_radius_km * KM_TO_MILES, 1),
     }
+    attrs.update(_incident_wfigs_attrs(i))
+    return attrs
+
 
 def _ngfs_tracked_attrs(c):
     fires = c.data.tracked_fires
@@ -566,6 +628,13 @@ async def async_setup_entry(
     async_add_entities(
         FirmsSensor(coordinator, entry, description) for description in SENSORS
     )
+
+    wfigs = getattr(coordinator, "wfigs", None)
+    if wfigs is not None:
+        async_add_entities([
+            WfigsSensor(wfigs, entry),
+        ])
+
     ngfs = getattr(coordinator, "ngfs", None)
     if ngfs is not None:
         async_add_entities([
@@ -641,6 +710,57 @@ class FirmsSensor(CoordinatorEntity[FirmsCoordinator], SensorEntity):
         return None
 
 
+class WfigsSensor(CoordinatorEntity[WfigsCoordinator], SensorEntity):
+    """WFIGS / IRWIN feed-health and nearby-incident sensor."""
+
+    _attr_has_entity_name = True
+    _attr_name = "WFIGS incidents"
+    _attr_icon = "mdi:fire-circle"
+    _attr_attribution = "Data courtesy of NIFC WFIGS / IRWIN"
+
+    def __init__(self, coordinator, entry) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_wfigs_incidents"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            name=entry.title,
+            manufacturer="NASA / NOAA / NIFC",
+            model="Wildfire monitoring",
+            entry_type=DeviceEntryType.SERVICE,
+        )
+
+    @property
+    def native_value(self):
+        if not self.coordinator.data.monitoring_active:
+            return None
+        return len(self.coordinator.data.incidents)
+
+    @property
+    def extra_state_attributes(self):
+        data = self.coordinator.data
+        nearest = data.nearest
+        return {
+            "monitoring_active": data.monitoring_active,
+            "records_received": data.records_received,
+            "records_in_radius": data.records_in_radius,
+            "monitoring_radius_miles": round(
+                self.coordinator.radius_km * KM_TO_MILES, 1
+            ),
+            "nearest_distance_miles": (
+                round(nearest.distance_km * KM_TO_MILES, 1)
+                if nearest else None
+            ),
+            "nearest_name": (
+                nearest.incident.name if nearest else None
+            ),
+            "last_successful_update": (
+                data.last_successful_update.isoformat()
+                if data.last_successful_update else None
+            ),
+            "error": data.error,
+        }
+
+
 class NgfsSensor(CoordinatorEntity[NgfsCoordinator], SensorEntity):
     """One aggregate NOAA NGFS value."""
     _attr_has_entity_name = True
@@ -648,16 +768,22 @@ class NgfsSensor(CoordinatorEntity[NgfsCoordinator], SensorEntity):
     def __init__(self, coordinator, entry, key, name, icon, value_fn, attrs_fn=None, unit=None):
         super().__init__(coordinator); self._attr_unique_id=f"{entry.entry_id}_ngfs_{key}"; self._attr_name=name; self._attr_icon=icon
         self._value_fn=value_fn; self._attrs_fn=attrs_fn; self._attr_native_unit_of_measurement=unit
-        self._attr_device_info=DeviceInfo(identifiers={(DOMAIN, entry.entry_id)}, name=entry.title, manufacturer="NOAA / NASA", model="Wildfire satellite monitoring", entry_type=DeviceEntryType.SERVICE)
+        self._attr_device_info=DeviceInfo(identifiers={(DOMAIN, entry.entry_id)}, name=entry.title, manufacturer="NASA / NOAA / NIFC", model="Wildfire monitoring", entry_type=DeviceEntryType.SERVICE)
     @property
     def attribution(self) -> str:
-        if self._attr_unique_id.endswith("_ngfs_combined_nearest_fire"):
-            source, _ = _combined_nearest(self.coordinator)
-            if source == "FIRMS":
-                return ATTRIBUTION
-            if source == "NGFS":
-                return "Data courtesy of NOAA NESDIS Next Generation Fire System (experimental)"
-            return f"{ATTRIBUTION}; NOAA NESDIS Next Generation Fire System (experimental)"
+        combined_keys = (
+            "_ngfs_combined_nearest_fire",
+            "_ngfs_nearby_wildfires",
+            "_ngfs_nearest_combined_incident",
+            "_ngfs_named_wildfires",
+            "_ngfs_nearest_named_wildfire",
+        )
+        if self._attr_unique_id.endswith(combined_keys):
+            return (
+                f"{ATTRIBUTION}; "
+                "NOAA NESDIS Next Generation Fire System (experimental); "
+                "NIFC WFIGS / IRWIN"
+            )
         return "Data courtesy of NOAA NESDIS Next Generation Fire System (experimental)"
     @property
     def native_value(self): return self._value_fn(self.coordinator)
