@@ -12,6 +12,8 @@ from homeassistant.loader import async_get_loaded_integration
 from .api import CelesTrakClient, FirmsClient, MetNoClient, PlaceIndex
 from .ngfs import NgfsClient
 from .ngfs_coordinator import NgfsCoordinator
+from .wfigs import WfigsClient
+from .wfigs_coordinator import WfigsCoordinator
 from .const import (
     CONF_MAP_KEY,
     CONF_REGION,
@@ -41,7 +43,9 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
 
 @callback
-def _async_repair_region(hass: HomeAssistant, entry: NasaFirmsConfigEntry) -> None:
+def _async_repair_region(
+    hass: HomeAssistant, entry: NasaFirmsConfigEntry
+) -> None:
     """Rewrite the one stored region name that never worked.
 
     `Russia_and_Asia` was offered in the setup dropdown from the first release
@@ -56,18 +60,21 @@ def _async_repair_region(hass: HomeAssistant, entry: NasaFirmsConfigEntry) -> No
     """
     if entry.data.get(CONF_REGION) != "Russia_and_Asia":
         return
+
     hass.config_entries.async_update_entry(
-        entry, data={**entry.data, CONF_REGION: "Russia_Asia"}
+        entry,
+        data={**entry.data, CONF_REGION: "Russia_Asia"},
     )
 
 
-
-
 @callback
-def _async_orbit_client(hass: HomeAssistant, session) -> CelesTrakClient:
+def _async_orbit_client(
+    hass: HomeAssistant, session
+) -> CelesTrakClient:
     """One CelesTrak client/cache shared by all FIRMS config entries."""
     return hass.data.setdefault(DOMAIN, {}).setdefault(
-        "orbit_client", CelesTrakClient(session)
+        "orbit_client",
+        CelesTrakClient(session),
     )
 
 
@@ -80,49 +87,109 @@ def _async_place_index(hass: HomeAssistant) -> PlaceIndex:
     one per entry. Nothing is read from disk here; the index loads itself on
     first use, inside an executor.
     """
-    return hass.data.setdefault(DOMAIN, {}).setdefault(DATA_PLACES, PlaceIndex())
+    return hass.data.setdefault(DOMAIN, {}).setdefault(
+        DATA_PLACES,
+        PlaceIndex(),
+    )
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: NasaFirmsConfigEntry) -> bool:
-    """Set up NASA FIRMS from a config entry."""
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: NasaFirmsConfigEntry,
+) -> bool:
+    """Set up Wildfire Monitor from a config entry."""
     _async_repair_region(hass, entry)
+
     session = async_get_clientsession(hass)
-    client = FirmsClient(session, entry.data[CONF_MAP_KEY], entry.data[CONF_REGION])
+
+    client = FirmsClient(
+        session,
+        entry.data[CONF_MAP_KEY],
+        entry.data[CONF_REGION],
+    )
+
     weather = MetNoClient(
         session,
-        USER_AGENT.format(version=async_get_loaded_integration(hass, DOMAIN).version),
+        USER_AGENT.format(
+            version=async_get_loaded_integration(hass, DOMAIN).version
+        ),
     )
+
     coordinator = FirmsCoordinator(
-        hass, entry, client, weather, _async_place_index(hass), _async_orbit_client(hass, session)
+        hass,
+        entry,
+        client,
+        weather,
+        _async_place_index(hass),
+        _async_orbit_client(hass, session),
     )
+
     # Before the first refresh, not after: that refresh already filters, and
     # without the learned history it would republish every known factory for
     # one cycle. A burst of fires that are not fires, right after a restart,
     # is precisely the thing someone opens an issue about.
     await coordinator.async_load_sources()
     await coordinator.async_config_entry_first_refresh()
-    ngfs = NgfsCoordinator(hass, entry, NgfsClient(session), coordinator)
+
+    # NIFC WFIGS / IRWIN reported wildfire incidents.
+    wfigs = WfigsCoordinator(
+        hass,
+        entry,
+        WfigsClient(session),
+        coordinator,
+    )
+    await wfigs.async_config_entry_first_refresh()
+    coordinator.wfigs = wfigs
+
+    # NOAA NGFS rapid geostationary fire detection.
+    # Start NGFS after WFIGS so the first combined-incident calculation
+    # already has the reported-incident layer available.
+    ngfs = NgfsCoordinator(
+        hass,
+        entry,
+        NgfsClient(session),
+        coordinator,
+    )
     await ngfs.async_config_entry_first_refresh()
     coordinator.ngfs = ngfs
+
     entry.runtime_data = coordinator
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    entry.async_on_unload(entry.add_update_listener(_async_options_updated))
+
+    await hass.config_entries.async_forward_entry_setups(
+        entry,
+        PLATFORMS,
+    )
+
+    entry.async_on_unload(
+        entry.add_update_listener(_async_options_updated)
+    )
+
     return True
 
 
 async def _async_options_updated(
-    hass: HomeAssistant, entry: NasaFirmsConfigEntry
+    hass: HomeAssistant,
+    entry: NasaFirmsConfigEntry,
 ) -> None:
     """Reload on options change so the coordinator picks up new filters."""
     await hass.config_entries.async_reload(entry.entry_id)
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: NasaFirmsConfigEntry) -> bool:
+async def async_unload_entry(
+    hass: HomeAssistant,
+    entry: NasaFirmsConfigEntry,
+) -> bool:
     """Unload a config entry."""
-    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    return await hass.config_entries.async_unload_platforms(
+        entry,
+        PLATFORMS,
+    )
 
 
-async def async_remove_entry(hass: HomeAssistant, entry: NasaFirmsConfigEntry) -> None:
+async def async_remove_entry(
+    hass: HomeAssistant,
+    entry: NasaFirmsConfigEntry,
+) -> None:
     """Delete the learned source history along with the entry.
 
     The store is keyed per entry and nothing else references it, so removing
@@ -131,5 +198,7 @@ async def async_remove_entry(hass: HomeAssistant, entry: NasaFirmsConfigEntry) -
     ever seen burn.
     """
     await Store(
-        hass, SOURCES_STORAGE_VERSION, f"{SOURCES_STORAGE_KEY}.{entry.entry_id}"
+        hass,
+        SOURCES_STORAGE_VERSION,
+        f"{SOURCES_STORAGE_KEY}.{entry.entry_id}",
     ).async_remove()
