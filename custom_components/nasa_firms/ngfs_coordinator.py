@@ -11,10 +11,11 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .api import WeatherError, WindObservation, bearing_deg, cardinal, haversine_km
 from .const import (CONF_ALERT_RADIUS, DEFAULT_ALERT_RADIUS_M, CONF_NGFS_FULL_INTERVAL_MIN, CONF_NGFS_REDUCED_INTERVAL_MIN, DEFAULT_NGFS_FULL_INTERVAL_MIN, DEFAULT_NGFS_REDUCED_INTERVAL_MIN, MONITORING_DISABLED, MONITORING_REDUCED, NGFS_COLLECTION_EAST,
-    NGFS_COLLECTION_WEST, NGFS_LOOKBACK, NGFS_REDUCED_UPDATE_INTERVAL, NGFS_UPDATE_INTERVAL, EVENT_NEW_NGFS_FIRE)
+    NGFS_COLLECTION_WEST, NGFS_LOOKBACK, NGFS_REDUCED_UPDATE_INTERVAL, NGFS_UPDATE_INTERVAL, EVENT_NEW_NGFS_FIRE, EVENT_NEW_WILDFIRE)
 from .ngfs import NgfsClient, NgfsDetection, NgfsError
 
 _LOGGER = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True)
 class NgfsTrackedFire:
@@ -48,6 +49,21 @@ class CombinedIncident:
     firms_detections: int = 0
     ngfs_detections: int = 0
     match_distance_km: float | None = None
+    wfigs_irwin_id: str | None = None
+    wfigs_unique_fire_identifier: str | None = None
+    reported_acres: float | None = None
+    discovery_acres: float | None = None
+    percent_contained: float | None = None
+    fire_cause: str | None = None
+    fire_cause_general: str | None = None
+    discovery_time: datetime | None = None
+    wfigs_modified_time: datetime | None = None
+    protecting_agency: str | None = None
+    protecting_unit: str | None = None
+    management_organization: str | None = None
+    personnel: int | None = None
+    city: str | None = None
+    state: str | None = None
 
 
 def _firms_datetime(value: str | None) -> datetime | None:
@@ -68,6 +84,11 @@ def _firms_datetime(value: str | None) -> datetime | None:
 # tracked features can sit a few kilometres apart on the same fire front, but
 # unrelated fires should not be merged merely because they share a region.
 INCIDENT_MATCH_DISTANCE_KM = 5.0
+# An exact WFIGS/NGFS incident-name match is stronger evidence than proximity
+# alone, so allow a wider gate for large fires whose WFIGS point of origin can
+# be well behind the active thermal front. Still require geographic plausibility
+# so unrelated incidents with the same generic name cannot merge across a region.
+WFIGS_NAME_MATCH_DISTANCE_KM = 25.0
 INCIDENT_MATCH_TIME = timedelta(hours=24)
 FIRMS_INCIDENT_GROUP_DISTANCE_KM = 5.0
 
@@ -98,6 +119,10 @@ class NgfsData:
     # Fires that entered the configured alert radius for the first time during
     # this Home Assistant runtime. Empty on the initial baseline refresh.
     new_alert_fires: list[NgfsTrackedFire] = field(default_factory=list)
+    # Newly seen combined incidents inside the alert radius. The first
+    # successful refresh establishes a baseline, so HA restarts do not
+    # announce already-known WFIGS/FIRMS/NGFS incidents as new fires.
+    new_alert_incidents: list[CombinedIncident] = field(default_factory=list)
 
     @property
     def nearest(self) -> NgfsDetection | None:
@@ -124,6 +149,43 @@ class NgfsCoordinator(DataUpdateCoordinator[NgfsData]):
         # baseline yet. Keep IDs for the whole runtime so a temporary feed gap
         # does not create a duplicate "new fire" alert when a feature returns.
         self._seen_alert_tracking_ids: set[str] | None = None
+        # Incident-level alert identities. WFIGS IRWIN/UniqueFireIdentifier
+        # are preferred because they remain stable as thermal feeds join.
+        self._seen_alert_incident_ids: set[str] | None = None
+
+    @staticmethod
+    def _alert_incident_aliases(incident: CombinedIncident) -> set[str]:
+        """All known identities for one incident, used for cross-feed dedup."""
+        aliases: set[str] = set()
+
+        if incident.wfigs_irwin_id:
+            aliases.add(f"irwin:{incident.wfigs_irwin_id.strip().casefold()}")
+
+        if incident.wfigs_unique_fire_identifier:
+            aliases.add(
+                f"ufi:{incident.wfigs_unique_fire_identifier.strip().casefold()}"
+            )
+
+        for tracking_id in incident.ngfs_tracking_ids:
+            aliases.add(f"ngfs:{tracking_id}")
+
+        if incident.ngfs_tracking_id:
+            aliases.add(f"ngfs:{incident.ngfs_tracking_id}")
+
+        if incident.firms_cluster_id:
+            aliases.add(f"firms:{incident.firms_cluster_id}")
+
+        if not aliases:
+            aliases.add(incident.incident_id)
+
+        return aliases
+
+    @staticmethod
+    def _alert_source(incident: CombinedIncident) -> str:
+        """Human-readable source for notifications."""
+        if incident.source == "WFIGS":
+            return "WFIGS/IRWIN"
+        return incident.source
 
     def _collection(self) -> str:
         # GOES-West is preferred west of the central CONUS overlap; East otherwise.
@@ -138,8 +200,51 @@ class NgfsCoordinator(DataUpdateCoordinator[NgfsData]):
         try:
             found=await self.client.fetch(self._collection(), self._bbox, NGFS_LOOKBACK)
         except NgfsError as err:
-            _LOGGER.warning("NGFS fetch failed; FIRMS is unaffected: %s", err)
-            return NgfsData(error=str(err), collection=self._collection(), query_lookback_minutes=int(NGFS_LOOKBACK.total_seconds()/60))
+            _LOGGER.warning(
+                "NGFS fetch failed; retaining last-good NGFS/combined data; "
+                "FIRMS and WFIGS are unaffected: %s",
+                err,
+            )
+
+            previous = self.data
+            if (
+                isinstance(previous, NgfsData)
+                and previous.last_successful_update is not None
+            ):
+                return NgfsData(
+                    detections=list(previous.detections),
+                    monitoring_active=True,
+                    error=str(err),
+                    records_received=previous.records_received,
+                    records_in_radius=previous.records_in_radius,
+                    collection=self._collection(),
+                    last_successful_update=previous.last_successful_update,
+                    query_lookback_minutes=int(
+                        NGFS_LOOKBACK.total_seconds() / 60
+                    ),
+                    records_with_valid_coordinates=(
+                        previous.records_with_valid_coordinates
+                    ),
+                    nearest_raw_distance_km=previous.nearest_raw_distance_km,
+                    nearest_raw_latitude=previous.nearest_raw_latitude,
+                    nearest_raw_longitude=previous.nearest_raw_longitude,
+                    tracked_fires=list(previous.tracked_fires),
+                    tracked_wind=dict(previous.tracked_wind),
+                    nearest_tracked_wind=previous.nearest_tracked_wind,
+                    combined_incidents=list(previous.combined_incidents),
+                    matched_incidents=previous.matched_incidents,
+                    # A failed refresh cannot establish a genuinely new fire.
+                    new_alert_fires=[],
+                    new_alert_incidents=[],
+                )
+
+            return NgfsData(
+                error=str(err),
+                collection=self._collection(),
+                query_lookback_minutes=int(
+                    NGFS_LOOKBACK.total_seconds() / 60
+                ),
+            )
         nearby=[]
         raw_distances=[]
         for d in found:
@@ -231,6 +336,91 @@ class NgfsCoordinator(DataUpdateCoordinator[NgfsData]):
                 },
             )
 
+        # Cross-feed new-fire layer. The first successful combined refresh is
+        # baseline only, preventing HA restarts from announcing existing fires.
+        alert_incidents = [
+            i for i in combined_incidents
+            if i.distance_km <= self.alert_radius_km
+        ]
+        current_incident_aliases = [
+            (incident, self._alert_incident_aliases(incident))
+            for incident in alert_incidents
+        ]
+
+        if self._seen_alert_incident_ids is None:
+            new_alert_incidents: list[CombinedIncident] = []
+            self._seen_alert_incident_ids = {
+                alias
+                for _, aliases in current_incident_aliases
+                for alias in aliases
+            }
+        else:
+            new_alert_incidents = []
+            for incident, aliases in current_incident_aliases:
+                # Any overlapping alias means this physical incident has already
+                # been announced. This prevents NGFS-first -> WFIGS-later or
+                # WFIGS-first -> NGFS/FIRMS-later duplicate new-fire alerts.
+                if self._seen_alert_incident_ids.isdisjoint(aliases):
+                    new_alert_incidents.append(incident)
+
+                # Always learn every alias now known for the incident so future
+                # source associations continue to collapse to the same alert.
+                self._seen_alert_incident_ids.update(aliases)
+
+        for incident in new_alert_incidents:
+            # NGFS-only fires already generate the legacy wm14 event above.
+            # This first wm15 step adds WFIGS-backed reported-fire alerts.
+            if "WFIGS" not in incident.source:
+                continue
+
+            # Keep fully-contained WFIGS-only historical records visible, but
+            # do not announce them as newly active without current thermal heat.
+            fully_contained = (
+                incident.percent_contained is not None
+                and incident.percent_contained >= 100
+            )
+            has_thermal_heat = (
+                incident.firms_detections > 0
+                or incident.ngfs_detections > 0
+            )
+            if fully_contained and not has_thermal_heat:
+                continue
+
+            incident_bearing = bearing_deg(
+                self.latitude,
+                self.longitude,
+                incident.latitude,
+                incident.longitude,
+            )
+            self.hass.bus.async_fire(
+                EVENT_NEW_WILDFIRE,
+                {
+                    "entry_id": self.config_entry.entry_id,
+                    "incident_id": incident.incident_id,
+                    "irwin_id": incident.wfigs_irwin_id,
+                    "unique_fire_identifier": incident.wfigs_unique_fire_identifier,
+                    "name": incident.name,
+                    "source": self._alert_source(incident),
+                    "combined_source": incident.source,
+                    "distance_miles": round(incident.distance_km * 0.621371, 1),
+                    "direction": cardinal(incident_bearing),
+                    "bearing": round(incident_bearing),
+                    "reported_acres": incident.reported_acres,
+                    "discovery_acres": incident.discovery_acres,
+                    "percent_contained": incident.percent_contained,
+                    "fire_cause": incident.fire_cause_general or incident.fire_cause,
+                    "discovery_time": (
+                        incident.discovery_time.isoformat()
+                        if incident.discovery_time else None
+                    ),
+                    "latest": incident.latest.isoformat() if incident.latest else None,
+                    "max_frp": incident.max_frp,
+                    "firms_detections": incident.firms_detections,
+                    "ngfs_detections": incident.ngfs_detections,
+                    "alert_radius_miles": round(self.alert_radius_km * 0.621371, 1),
+                },
+            )
+
         return NgfsData(
             detections=[d for _,d in nearby],
             records_received=len(found),
@@ -248,6 +438,7 @@ class NgfsCoordinator(DataUpdateCoordinator[NgfsData]):
             combined_incidents=combined_incidents,
             matched_incidents=matched_incidents,
             new_alert_fires=new_alert_fires,
+            new_alert_incidents=new_alert_incidents,
         )
 
     def _combined_incidents(self, tracked: list[NgfsTrackedFire]) -> tuple[list[CombinedIncident], int]:
@@ -438,6 +629,171 @@ class NgfsCoordinator(DataUpdateCoordinator[NgfsData]):
                 latest=f_group["latest"], max_frp=f_group["max_frp"],
                 firms_cluster_id=f.id, firms_detections=f_group["detections"],
             ))
+
+        # WFIGS / IRWIN is the authoritative reported-incident layer. Merge it
+        # after the thermal FIRMS/NGFS association so a reported wildfire can
+        # exist with no current satellite heat, while a matching thermal fire
+        # inherits the official incident name and incident metadata.
+        wfigs = getattr(self.firms, "wfigs", None)
+        wfigs_incidents = (
+            list(wfigs.data.incidents)
+            if wfigs is not None and wfigs.data is not None
+            else []
+        )
+
+        def source_with_wfigs(source: str) -> str:
+            parts = set(source.split(" + "))
+            parts.add("WFIGS")
+            return " + ".join(
+                name for name in ("WFIGS", "NGFS", "FIRMS") if name in parts
+            )
+
+        for reported in wfigs_incidents:
+            w = reported.incident
+            w_name = w.name.strip().casefold() if w.name and w.name.strip() else None
+
+            # Prefer an exact incident-name association when NGFS already carries
+            # the WFIGS/IRWIN name, but still require geographic plausibility.
+            # The wider name gate accommodates large fires where WFIGS reports a
+            # point of origin while the thermal front has moved kilometres away.
+            name_candidates = []
+            for idx, incident in enumerate(incidents):
+                if (
+                    not w_name
+                    or not incident.name
+                    or incident.name.strip().casefold() != w_name
+                ):
+                    continue
+
+                gap = haversine_km(
+                    w.latitude,
+                    w.longitude,
+                    incident.latitude,
+                    incident.longitude,
+                )
+                if gap <= WFIGS_NAME_MATCH_DISTANCE_KM:
+                    name_candidates.append((gap, idx, incident))
+
+            if name_candidates:
+                wfigs_gap, match_idx, matched = min(
+                    name_candidates, key=lambda item: item[0]
+                )
+            else:
+                spatial_candidates = [
+                    (
+                        haversine_km(
+                            w.latitude,
+                            w.longitude,
+                            incident.latitude,
+                            incident.longitude,
+                        ),
+                        idx,
+                        incident,
+                    )
+                    for idx, incident in enumerate(incidents)
+                ]
+                spatial_candidates = [
+                    item
+                    for item in spatial_candidates
+                    if item[0] <= INCIDENT_MATCH_DISTANCE_KM
+                ]
+                if spatial_candidates:
+                    wfigs_gap, match_idx, matched = min(
+                        spatial_candidates, key=lambda item: item[0]
+                    )
+                else:
+                    matched = None
+                    match_idx = -1
+                    wfigs_gap = None
+
+            w_latest = w.modified_time or w.discovery_time
+
+            if matched is None:
+                incidents.append(
+                    CombinedIncident(
+                        incident_id=f"wfigs:{w.irwin_id or w.unique_fire_identifier or w.name or f'{w.latitude:.4f},{w.longitude:.4f}'}",
+                        source="WFIGS",
+                        name=w.name,
+                        distance_km=reported.distance_km,
+                        latitude=w.latitude,
+                        longitude=w.longitude,
+                        latest=w_latest,
+                        max_frp=None,
+                        wfigs_irwin_id=w.irwin_id,
+                        wfigs_unique_fire_identifier=w.unique_fire_identifier,
+                        reported_acres=w.acres,
+                        discovery_acres=w.discovery_acres,
+                        percent_contained=w.percent_contained,
+                        fire_cause=w.fire_cause,
+                        fire_cause_general=w.fire_cause_general,
+                        discovery_time=w.discovery_time,
+                        wfigs_modified_time=w.modified_time,
+                        protecting_agency=w.protecting_agency,
+                        protecting_unit=w.protecting_unit,
+                        management_organization=w.management_organization,
+                        personnel=w.personnel,
+                        city=w.city,
+                        state=w.state,
+                    )
+                )
+                continue
+
+            latest_values = [
+                value for value in (matched.latest, w_latest) if value is not None
+            ]
+            latest = max(latest_values) if latest_values else None
+
+            # Keep the closest representation for distance/ranking. WFIGS still
+            # retains its own official point through its metadata/IRWIN identity.
+            if reported.distance_km <= matched.distance_km:
+                latitude = w.latitude
+                longitude = w.longitude
+                distance_km = reported.distance_km
+            else:
+                latitude = matched.latitude
+                longitude = matched.longitude
+                distance_km = matched.distance_km
+
+            incidents[match_idx] = CombinedIncident(
+                incident_id=matched.incident_id,
+                source=source_with_wfigs(matched.source),
+                name=w.name or matched.name,
+                distance_km=distance_km,
+                latitude=latitude,
+                longitude=longitude,
+                latest=latest,
+                max_frp=matched.max_frp,
+                firms_cluster_id=matched.firms_cluster_id,
+                ngfs_tracking_id=matched.ngfs_tracking_id,
+                ngfs_tracking_ids=matched.ngfs_tracking_ids,
+                ngfs_tracking_features=matched.ngfs_tracking_features,
+                firms_detections=matched.firms_detections,
+                ngfs_detections=matched.ngfs_detections,
+                match_distance_km=(
+                    min(
+                        value
+                        for value in (matched.match_distance_km, wfigs_gap)
+                        if value is not None
+                    )
+                    if matched.match_distance_km is not None or wfigs_gap is not None
+                    else None
+                ),
+                wfigs_irwin_id=w.irwin_id,
+                wfigs_unique_fire_identifier=w.unique_fire_identifier,
+                reported_acres=w.acres,
+                discovery_acres=w.discovery_acres,
+                percent_contained=w.percent_contained,
+                fire_cause=w.fire_cause,
+                fire_cause_general=w.fire_cause_general,
+                discovery_time=w.discovery_time,
+                wfigs_modified_time=w.modified_time,
+                protecting_agency=w.protecting_agency,
+                protecting_unit=w.protecting_unit,
+                management_organization=w.management_organization,
+                personnel=w.personnel,
+                city=w.city,
+                state=w.state,
+            )
 
         incidents.sort(key=lambda item: item.distance_km)
         return incidents, len(matches)
