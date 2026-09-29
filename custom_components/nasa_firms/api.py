@@ -34,7 +34,7 @@ FIRMS_HOSTS = (
     "https://firms.modaps.eosdis.nasa.gov",
     "https://firms2.modaps.eosdis.nasa.gov",
 )
-BASE_URL = "{host}/mapserver/wfs/{region}/{map_key}/"
+BASE_URL = "{host}/api/area/csv/{map_key}/{source}/{area}/{day_range}"
 
 # Generous on purpose: the regional MapServers routinely take double-digit
 # seconds over a busy box. In the message as well as in the code, so the two
@@ -1229,59 +1229,105 @@ class FirmsClient:
         bbox: tuple[float, float, float, float],
         count: int,
     ) -> list[FirmsHotspot]:
-        """One GetFeature request against one FIRMS host."""
+        """One FIRMS Area API request against one FIRMS host."""
         lat_s, lon_w, lat_n, lon_e = bbox
-        url = BASE_URL.format(host=host, region=self._region, map_key=self._map_key)
-        params = {
-            "SERVICE": "WFS",
-            "REQUEST": "GetFeature",
-            "VERSION": "2.0.0",
-            "TYPENAME": f"ms:fires_{satellite}_{window}",
-            "STARTINDEX": "0",
-            "COUNT": str(count),
-            "SRSNAME": "urn:ogc:def:crs:EPSG::4326",
-            "BBOX": f"{lat_s:.4f},{lon_w:.4f},{lat_n:.4f},{lon_e:.4f},urn:ogc:def:crs:EPSG::4326",
-            "outputformat": "geojson",
+
+        source_map = {
+            "noaa20": "VIIRS_NOAA20_NRT",
+            "noaa21": "VIIRS_NOAA21_NRT",
+            "snpp": "VIIRS_SNPP_NRT",
+            "modis": "MODIS_NRT",
         }
+
+        source = source_map.get(satellite)
+        if source is None:
+            raise FirmsError(f"Unsupported FIRMS satellite source: {satellite}")
+
+        # FIRMS Area API expects west,south,east,north.
+        area = f"{lon_w:.4f},{lat_s:.4f},{lon_e:.4f},{lat_n:.4f}"
+
+        # The Area API accepts 1-5 days. Our old WFS choices were 24hrs/7days.
+        # Use one day for the normal 24-hour feed and five days for the
+        # historical window; downstream filtering still determines what is kept.
+        day_range = 1 if window == WINDOW_24H else 5
+
+        url = BASE_URL.format(
+            host=host,
+            map_key=self._map_key,
+            source=source,
+            area=area,
+            day_range=day_range,
+        )
+
         try:
             async with asyncio.timeout(FIRMS_TIMEOUT):
-                resp = await self._session.get(url, params=params)
+                resp = await self._session.get(url)
                 body = await resp.text()
         except TimeoutError as err:
-            # str() of a TimeoutError is empty, so folding it into the generic
-            # message put "FIRMS request failed: " with nothing after the
-            # colon into satellite_errors — every real timeout on the live
-            # instance read exactly like that. Say what actually happened.
-            raise FirmsError(f"FIRMS request timed out after {FIRMS_TIMEOUT} s") from err
+            raise FirmsError(
+                f"FIRMS request timed out after {FIRMS_TIMEOUT} s"
+            ) from err
         except aiohttp.ClientError as err:
             raise FirmsError(f"FIRMS request failed: {err}") from err
-        if resp.status in (401, 403):
-            # NASA's own words stay in the message. Its 403 text does not
-            # even distinguish a bad key from an exhausted transaction limit,
-            # but a bare "rejected" hid that much and sent issue #2's
-            # reporter source-diving to learn what the server actually said.
+
+        if resp.status in (401, 403) or (
+            resp.status == 400 and "Invalid MAP_KEY" in body
+        ):
             detail = _short_body(body) or "no response body"
             raise FirmsAuthError(
-                f"{host.removeprefix('https://')} answered HTTP {resp.status}: {detail}"
+                f"{host.removeprefix('https://')} answered "
+                f"HTTP {resp.status}: {detail}"
             )
+
         if resp.status != 200:
-            raise FirmsError(f"FIRMS returned HTTP {resp.status}: {body[:200]}")
+            raise FirmsError(
+                f"FIRMS returned HTTP {resp.status}: {body[:200]}"
+            )
+
         try:
-            data = json.loads(body)
-        except ValueError as err:
-            # Invalid keys come back as an HTML/XML error page, not GeoJSON.
-            if "map_key" in body.lower():
-                raise FirmsAuthError(
-                    f"{host.removeprefix('https://')} rejected the MAP_KEY: "
-                    f"{_short_body(body)}"
-                ) from err
-            raise FirmsError(f"Unexpected non-GeoJSON response: {body[:200]}") from err
-        features = data.get("features") or []
-        return [
-            h
-            for h in (self._parse_feature(f, satellite) for f in features)
-            if h is not None
-        ]
+            rows = list(csv.DictReader(body.splitlines()))
+        except (csv.Error, UnicodeError) as err:
+            raise FirmsError(f"Unexpected FIRMS CSV response: {body[:200]}") from err
+
+        hotspots: list[FirmsHotspot] = []
+
+        for row in rows[:count]:
+            try:
+                latitude = float(row["latitude"])
+                longitude = float(row["longitude"])
+            except (KeyError, TypeError, ValueError):
+                continue
+
+            def _num(key: str) -> float | None:
+                try:
+                    value = row.get(key)
+                    return float(value) if value not in (None, "") else None
+                except (TypeError, ValueError):
+                    return None
+
+            acq = None
+            acq_date = row.get("acq_date")
+            if acq_date:
+                try:
+                    t = f"{int(float(row.get('acq_time') or 0)):04d}"
+                except (TypeError, ValueError):
+                    t = "0000"
+                acq = f"{acq_date} {t[:2]}:{t[2:]} UTC"
+
+            hotspots.append(
+                FirmsHotspot(
+                    latitude=latitude,
+                    longitude=longitude,
+                    satellite=satellite,
+                    frp=_num("frp"),
+                    confidence=normalize_confidence(row.get("confidence")),
+                    raw_confidence=row.get("confidence"),
+                    brightness=_num("bright_ti4") or _num("brightness"),
+                    acq_datetime=acq,
+                )
+            )
+
+        return hotspots
 
     @staticmethod
     def _parse_feature(feature: dict, satellite: str) -> FirmsHotspot | None:
